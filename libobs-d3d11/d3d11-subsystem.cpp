@@ -25,8 +25,6 @@
 #include <winternl.h>
 #include <d3d9.h>
 #include "d3d11-subsystem.hpp"
-#include "d3d11-config.h"
-#include "intel-nv12-support.hpp"
 
 struct UnsupportedHWError : HRError {
 	inline UnsupportedHWError(const char *str, HRESULT hr)
@@ -184,40 +182,24 @@ gs_swap_chain::gs_swap_chain(gs_device *device, const gs_init_data *data)
 	  hwnd((HWND)data->window.hwnd),
 	  initData(*data)
 {
-	struct win_version_info ver;
-	get_win_ver(&ver);
-
-	constexpr win_version_info minimum = [] {
-		win_version_info ver{};
-		ver.major = 10;
-		ver.minor = 0;
-		ver.build = 22000;
-		ver.revis = 0;
-		return ver;
-	}();
-
 	DXGI_SWAP_EFFECT effect = DXGI_SWAP_EFFECT_DISCARD;
 	UINT flags = 0;
 
-	if (win_version_compare(&ver, &minimum) >= 0) {
+	ComQIPtr<IDXGIFactory5> factory5 = device->factory;
+	if (factory5) {
 		initData.num_backbuffers = max(data->num_backbuffers, 2);
 
 		effect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 		flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
-		ComPtr<IDXGIFactory5> factory5;
-		factory5 = ComQIPtr<IDXGIFactory5>(device->factory);
-		if (factory5) {
-			BOOL featureSupportData = FALSE;
-			const HRESULT hr = factory5->CheckFeatureSupport(
-				DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-				&featureSupportData,
-				sizeof(featureSupportData));
-			if (SUCCEEDED(hr) && featureSupportData) {
-				presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+		BOOL featureSupportData = FALSE;
+		const HRESULT hr = factory5->CheckFeatureSupport(
+			DXGI_FEATURE_PRESENT_ALLOW_TEARING, &featureSupportData,
+			sizeof(featureSupportData));
+		if (SUCCEEDED(hr) && featureSupportData) {
+			presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
 
-				flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-			}
+			flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 		}
 	}
 
@@ -393,7 +375,7 @@ try {
 	gs_vertex_shader nv12_vs(this, "", NV12_VS);
 	gs_pixel_shader nv12_y_ps(this, "", NV12_Y_PS);
 	gs_pixel_shader nv12_uv_ps(this, "", NV12_UV_PS);
-	gs_stage_surface nv12_stage(this, NV12_CX, NV12_CY);
+	gs_stage_surface nv12_stage(this, NV12_CX, NV12_CY, false);
 
 	gs_vb_data *vbd = gs_vbdata_create();
 	vbd->num = 4;
@@ -534,6 +516,16 @@ static bool set_priority(ID3D11Device *device)
 
 #endif
 
+static bool CheckFormat(ID3D11Device *device, DXGI_FORMAT format)
+{
+	constexpr UINT required = D3D11_FORMAT_SUPPORT_TEXTURE2D |
+				  D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+
+	UINT support = 0;
+	return SUCCEEDED(device->CheckFormatSupport(format, &support)) &&
+	       ((support & required) == required);
+}
+
 void gs_device::InitDevice(uint32_t adapterIdx)
 {
 	wstring adapterName;
@@ -585,14 +577,10 @@ void gs_device::InitDevice(uint32_t adapterIdx)
 	/* check for nv12 texture output support    */
 
 	nv12Supported = false;
+	p010Supported = false;
 
 	/* WARP NV12 support is suspected to be buggy on older Windows */
 	if (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c) {
-		return;
-	}
-
-	/* Intel CopyResource is very slow with NV12 */
-	if (desc.VendorId == 0x8086 && IsOldIntelPlatform(desc.DeviceId)) {
 		return;
 	}
 
@@ -609,27 +597,9 @@ void gs_device::InitDevice(uint32_t adapterIdx)
 		return;
 	}
 
-	/* needs to support the actual format */
-	UINT support = 0;
-	hr = device->CheckFormatSupport(DXGI_FORMAT_NV12, &support);
-	if (FAILED(hr)) {
-		return;
-	}
-
-	if ((support & D3D11_FORMAT_SUPPORT_TEXTURE2D) == 0) {
-		return;
-	}
-
-	/* must be usable as a render target */
-	if ((support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) == 0) {
-		return;
-	}
-
-	if (HasBadNV12Output()) {
-		return;
-	}
-
-	nv12Supported = true;
+	nv12Supported = CheckFormat(device, DXGI_FORMAT_NV12) &&
+			!HasBadNV12Output();
+	p010Supported = nv12Supported && CheckFormat(device, DXGI_FORMAT_P010);
 }
 
 static inline void ConvertStencilSide(D3D11_DEPTH_STENCILOP_DESC &desc,
@@ -1378,8 +1348,7 @@ void device_resize(gs_device_t *device, uint32_t cx, uint32_t cy)
 	}
 
 	try {
-		ID3D11RenderTargetView *renderView = NULL;
-		device->context->OMSetRenderTargets(1, &renderView, NULL);
+		device->context->OMSetRenderTargets(0, NULL, NULL);
 		device->curSwapChain->Resize(cx, cy);
 		device->curFramebufferInvalidate = true;
 	} catch (const HRError &error) {
@@ -2218,11 +2187,17 @@ void device_load_swapchain(gs_device_t *device, gs_swapchain_t *swapchain)
 void device_clear(gs_device_t *device, uint32_t clear_flags,
 		  const struct vec4 *color, float depth, uint8_t stencil)
 {
-	int side = device->curRenderSide;
-	if ((clear_flags & GS_CLEAR_COLOR) != 0 && device->curRenderTarget)
-		device->context->ClearRenderTargetView(
-			device->curRenderTarget->renderTarget[side],
-			color->ptr);
+	if (clear_flags & GS_CLEAR_COLOR) {
+		gs_texture_2d *const tex = device->curRenderTarget;
+		if (tex) {
+			const int side = device->curRenderSide;
+			ID3D11RenderTargetView *const rtv =
+				device->curFramebufferSrgb
+					? tex->renderTargetLinear[side]
+					: tex->renderTarget[side];
+			device->context->ClearRenderTargetView(rtv, color->ptr);
+		}
+	}
 
 	if (device->curZStencilBuffer) {
 		uint32_t flags = 0;
@@ -2942,6 +2917,11 @@ extern "C" EXPORT bool device_nv12_available(gs_device_t *device)
 	return device->nv12Supported;
 }
 
+extern "C" EXPORT bool device_p010_available(gs_device_t *device)
+{
+	return device->p010Supported;
+}
+
 extern "C" EXPORT void device_debug_marker_begin(gs_device_t *,
 						 const char *markername,
 						 const float color[4])
@@ -3161,8 +3141,47 @@ device_texture_create_nv12(gs_device_t *device, gs_texture_t **p_tex_y,
 		return false;
 	}
 
-	tex_y->pairedNV12texture = tex_uv;
-	tex_uv->pairedNV12texture = tex_y;
+	tex_y->pairedTexture = tex_uv;
+	tex_uv->pairedTexture = tex_y;
+
+	*p_tex_y = tex_y;
+	*p_tex_uv = tex_uv;
+	return true;
+}
+
+extern "C" EXPORT bool
+device_texture_create_p010(gs_device_t *device, gs_texture_t **p_tex_y,
+			   gs_texture_t **p_tex_uv, uint32_t width,
+			   uint32_t height, uint32_t flags)
+{
+	if (!device->p010Supported)
+		return false;
+
+	*p_tex_y = nullptr;
+	*p_tex_uv = nullptr;
+
+	gs_texture_2d *tex_y;
+	gs_texture_2d *tex_uv;
+
+	try {
+		tex_y = new gs_texture_2d(device, width, height, GS_R16, 1,
+					  nullptr, flags, GS_TEXTURE_2D, false,
+					  true);
+		tex_uv = new gs_texture_2d(device, tex_y->texture, flags);
+
+	} catch (const HRError &error) {
+		blog(LOG_ERROR, "gs_texture_create_p010 (D3D11): %s (%08lX)",
+		     error.str, error.hr);
+		LogD3D11ErrorDetails(error, device);
+		return false;
+
+	} catch (const char *error) {
+		blog(LOG_ERROR, "gs_texture_create_p010 (D3D11): %s", error);
+		return false;
+	}
+
+	tex_y->pairedTexture = tex_uv;
+	tex_uv->pairedTexture = tex_y;
 
 	*p_tex_y = tex_y;
 	*p_tex_uv = tex_uv;
@@ -3175,7 +3194,25 @@ device_stagesurface_create_nv12(gs_device_t *device, uint32_t width,
 {
 	gs_stage_surface *surf = NULL;
 	try {
-		surf = new gs_stage_surface(device, width, height);
+		surf = new gs_stage_surface(device, width, height, false);
+	} catch (const HRError &error) {
+		blog(LOG_ERROR,
+		     "device_stagesurface_create (D3D11): %s "
+		     "(%08lX)",
+		     error.str, error.hr);
+		LogD3D11ErrorDetails(error, device);
+	}
+
+	return surf;
+}
+
+extern "C" EXPORT gs_stagesurf_t *
+device_stagesurface_create_p010(gs_device_t *device, uint32_t width,
+				uint32_t height)
+{
+	gs_stage_surface *surf = NULL;
+	try {
+		surf = new gs_stage_surface(device, width, height, true);
 	} catch (const HRError &error) {
 		blog(LOG_ERROR,
 		     "device_stagesurface_create (D3D11): %s "
