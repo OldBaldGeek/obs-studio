@@ -365,8 +365,7 @@ void OBSBasic::TransitionToScene(OBSSource source, bool force,
 			if (!sceneDuplicationMode && lastScene == source)
 				return;
 
-			if (swapScenesMode && lastScene &&
-			    lastScene != GetCurrentSceneSource())
+			if (lastScene && lastScene != GetCurrentSceneSource())
 				swapScene = lastProgramScene;
 		}
 	}
@@ -931,6 +930,10 @@ void OBSBasic::TBarReleased()
 
 	} else if (val <= T_BAR_CLAMP) {
 		obs_transition_set_manual_time(transition, 0.0f);
+		if (swapScene) {
+			programScene = swapScene;
+			swapScene = nullptr;
+		}
 		TransitionFullyStopped();
 		tBar->blockSignals(true);
 		tBar->setValue(0);
